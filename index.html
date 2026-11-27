@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Huellitas - Donaciones con Solana</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #fff7ed; color: #3b2314; }
+  header { background: #c2410c; color: #fff; padding: 24px 16px; text-align: center; }
+  header h1 { margin: 0 0 4px; }
+  main { max-width: 560px; margin: auto; padding: 16px; display: grid; gap: 16px; }
+  section { background: #fff; border-radius: 16px; padding: 16px; box-shadow: 0 2px 10px #0001; min-width: 0; }
+  h2 { margin-top: 0; font-size: 1.1rem; }
+  input, button { font: inherit; padding: 10px; border-radius: 10px; border: 1px solid #d6c3b5; }
+  input { width: 100%; margin: 4px 0 10px; }
+  button { background: #c2410c; color: #fff; border: 0; cursor: pointer; }
+  button.sec { background: #ffedd5; color: #3b2314; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  progress { width: 100%; height: 18px; accent-color: #c2410c; }
+  .botones { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  #qr { display: flex; justify-content: center; margin: 12px 0; }
+  #estado { font-weight: bold; overflow-wrap: anywhere; }
+  li { margin-bottom: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🐾 Huellitas</h1>
+  <div>Refugio ficticio · Proyecto escolar en devnet, sin dinero real</div>
+</header>
+<main>
+  <section>
+    <h2>Meta: croquetas y vacunas</h2>
+    <progress id="barra" max="5000" value="0"></progress>
+    <p id="avance"></p>
+  </section>
+
+  <section>
+    <h2>Haz una donación de prueba</h2>
+    <div class="botones">
+      <button class="sec monto" data-monto="20">$20</button>
+      <button class="sec monto" data-monto="50">$50</button>
+      <button class="sec monto" data-monto="100">$100</button>
+    </div>
+    <label>Cantidad en pesos (MXN)
+      <input id="monto" type="number" min="1" step="0.01" value="50">
+    </label>
+    <label>Tu nombre (opcional, no se envía a la blockchain)
+      <input id="nombre" maxlength="40">
+    </label>
+    <div class="botones">
+      <button id="qrBoton">Donar con QR</button>
+      <button id="phantom" disabled>Donar con Phantom</button>
+      <button id="cancelar" class="sec" disabled>Cancelar</button>
+    </div>
+    <div id="qr"></div>
+    <p id="estado" aria-live="polite"></p>
+  </section>
+
+  <section>
+    <h2>Donaciones registradas en este navegador</h2>
+    <ul id="historial"></ul>
+  </section>
+
+  <section>
+    <h2>Configuración</h2>
+    <label>Wallet que recibe (dirección pública)
+      <input id="refugio" placeholder="Pega una dirección de devnet">
+    </label>
+    <label>Pesos por 1 SOL (valor de ejemplo, ajústalo)
+      <input id="cambio" type="number" min="0.01" step="0.01" value="2500">
+    </label>
+  </section>
+</main>
+
+<script src="https://unpkg.com/@solana/web3.js@1.98.0/lib/index.iife.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const LAMPORTS = 1_000_000_000; // 1 SOL
+const PROGRAM_ID = ""; // Pega aquí el ID de tu programa (declare_id)
+const pesos = n => new Intl.NumberFormat("es-MX", { style: "currency", currency: "MXN" }).format(n);
+const aSOL = l => (l / LAMPORTS).toFixed(9).replace(/\.?0+$/, "");
+
+function leer(clave, defecto) {
+  try { return JSON.parse(localStorage.getItem("huellitas_" + clave)) ?? defecto; } catch { return defecto; }
+}
+function guardar(clave, valor) {
+  try { localStorage.setItem("huellitas_" + clave, JSON.stringify(valor)); } catch {}
+}
+
+let donaciones = leer("donaciones", []);
+let pendiente = null;
+let conexion = null;
+
+$("refugio").value = leer("refugio", "");
+$("cambio").value = leer("cambio", 2500);
+$("refugio").onchange = e => guardar("refugio", e.target.value.trim());
+$("cambio").onchange = e => guardar("cambio", Number(e.target.value));
+
+function pintar() {
+  const total = donaciones.reduce((s, d) => s + Math.round(d.mxn * 100), 0) / 100;
+  $("barra").value = total;
+  $("avance").textContent = `${pesos(total)} de ${pesos(5000)} MXN`;
+  $("historial").replaceChildren(...donaciones.slice().reverse().map(d => {
+    const li = document.createElement("li");
+    li.textContent = `${d.fecha} · ${d.nombre || "Anónimo"} · ${pesos(d.mxn)} `;
+    const a = document.createElement("a");
+    a.href = `https://explorer.solana.com/tx/${d.firma}?cluster=devnet`;
+    a.target = "_blank";
+    a.textContent = "Ver";
+    li.append(a);
+    return li;
+  }));
+  const ocupado = pendiente !== null;
+  for (const el of document.querySelectorAll(".monto, #monto, #nombre, #refugio, #cambio, #qrBoton"))
+    el.disabled = ocupado;
+  $("phantom").disabled = $("cancelar").disabled = !ocupado;
+}
+
+for (const b of document.querySelectorAll(".monto"))
+  b.onclick = () => { $("monto").value = b.dataset.monto; };
+
+// 1. Prepara la donación y muestra el QR de Solana Pay
+$("qrBoton").onclick = () => {
+  if (!window.solanaWeb3 || !window.QRCode) {
+    $("estado").textContent = "No cargaron las librerías. Revisa tu internet.";
+    return;
+  }
+  const mxn = Math.round(Number($("monto").value) * 100) / 100;
+  const lamports = Math.round(mxn / Number($("cambio").value) * LAMPORTS);
+  if (!(mxn >= 1) || !Number.isFinite(lamports) || lamports <= 0) {
+    $("estado").textContent = "Revisa la cantidad (mínimo $1) y el tipo de cambio.";
+    return;
+  }
+  let destino;
+  try {
+    destino = new solanaWeb3.PublicKey($("refugio").value.trim());
+  } catch {
+    $("estado").textContent = "En Configuración, escribe una dirección de wallet válida.";
+    return;
+  }
+  conexion ??= new solanaWeb3.Connection(solanaWeb3.clusterApiUrl("devnet"), "confirmed");
+  // La referencia es una llave única que identifica esta donación
+  const referencia = solanaWeb3.Keypair.generate().publicKey;
+  pendiente = { destino, referencia, lamports, mxn, nombre: $("nombre").value.trim() };
+
+  const url = `solana:${destino.toBase58()}?amount=${aSOL(lamports)}` +
+    `&reference=${referencia.toBase58()}&label=Huellitas&message=Donacion`;
+  $("qr").replaceChildren();
+  new QRCode($("qr"), { text: url, width: 220, height: 220 });
+  $("estado").textContent = `Esperando tu donación de ${pesos(mxn)} (${aSOL(lamports)} SOL)...`;
+  pintar();
+  verificar(pendiente);
+};
+
+// Instrucción "donar" del programa programa/lib.rs
+function instruccionDonar(donante, d) {
+  const datos = new Uint8Array(24);
+  datos.set([98, 7, 180, 6, 111, 66, 32, 20]); // identificador de Anchor para "donar"
+  const vista = new DataView(datos.buffer);
+  vista.setBigUint64(8, BigInt(d.lamports), true);
+  vista.setBigUint64(16, BigInt(Math.round(d.mxn * 100)), true);
+  return new solanaWeb3.TransactionInstruction({
+    programId: new solanaWeb3.PublicKey(PROGRAM_ID),
+    keys: [
+      { pubkey: donante, isSigner: true, isWritable: true },
+      { pubkey: d.destino, isSigner: false, isWritable: true },
+      { pubkey: solanaWeb3.SystemProgram.programId, isSigner: false, isWritable: false }
+    ],
+    data: datos
+  });
+}
+
+// 2. Alternativa: donar desde la extensión Phantom
+$("phantom").onclick = async () => {
+  const actual = pendiente;
+  const wallet = window.phantom?.solana;
+  if (!wallet) {
+    $("estado").textContent = "No se detectó Phantom en este navegador.";
+    return;
+  }
+  try {
+    $("phantom").disabled = true;
+    const { publicKey } = await wallet.connect();
+    // Con PROGRAM_ID se usa tu programa; sin él, una transferencia directa
+    const instruccion = PROGRAM_ID
+      ? instruccionDonar(publicKey, actual)
+      : solanaWeb3.SystemProgram.transfer({
+          fromPubkey: publicKey, toPubkey: actual.destino, lamports: actual.lamports
+        });
+    instruccion.keys.push({ pubkey: actual.referencia, isSigner: false, isWritable: false });
+    const tx = new solanaWeb3.Transaction().add(instruccion);
+    tx.feePayer = publicKey;
+    tx.recentBlockhash = (await conexion.getLatestBlockhash()).blockhash;
+    if (pendiente !== actual) return;
+    await wallet.signAndSendTransaction(tx);
+    if (pendiente === actual) $("estado").textContent = "Donación enviada, confirmando...";
+  } catch (err) {
+    if (pendiente === actual) {
+      $("estado").textContent = "No se pudo donar: " + err.message;
+      $("phantom").disabled = false;
+    }
+  }
+};
+
+// 3. Busca la transacción en la blockchain y comprueba el monto
+async function verificar(actual) {
+  if (pendiente !== actual) return;
+  try {
+    const firmas = await conexion.getSignaturesForAddress(actual.referencia, {}, "confirmed");
+    for (const { signature, err } of firmas) {
+      if (err) continue;
+      const tx = await conexion.getParsedTransaction(signature,
+        { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
+      if (!tx || tx.meta.err) continue;
+      const i = tx.transaction.message.accountKeys.findIndex(
+        k => k.pubkey.toBase58() === actual.destino.toBase58());
+      if (i >= 0 && tx.meta.postBalances[i] - tx.meta.preBalances[i] >= actual.lamports) {
+        if (pendiente !== actual) return;
+        donaciones.push({
+          fecha: new Date().toLocaleString("es-MX", { timeZone: "America/Mexico_City" }),
+          nombre: actual.nombre, mxn: actual.mxn, firma: signature
+        });
+        guardar("donaciones", donaciones);
+        pendiente = null;
+        $("qr").replaceChildren();
+        $("estado").textContent = "🐶 ¡Donación confirmada! Gracias.";
+        pintar();
+        return;
+      }
+    }
+  } catch (e) {
+    console.warn("Reintentando verificación:", e.message);
+  }
+  setTimeout(() => verificar(actual), 4000);
+}
+
+$("cancelar").onclick = () => {
+  if (!confirm("¿Cancelar? Si ya pagaste, la donación no quedará registrada.")) return;
+  pendiente = null;
+  $("qr").replaceChildren();
+  $("estado").textContent = "";
+  pintar();
+};
+
+pintar();
+</script>
+</body>
+</html>
